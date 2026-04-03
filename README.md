@@ -1,6 +1,6 @@
 # YC-Bench
 
-[![⭐ OpenReward Environment](https://img.shields.io/badge/%E2%AD%90%20OpenReward-Environment-f7e6cc)](https://openreward.ai/GeneralReasoning/YC-Bench)
+[![⭐ OpenReward Environment](https://img.shields.io/badge/%E2%AD%90%20OpenReward-Environment-f7e6cc)](https://openreward.ai/collinear/YC-Bench)
 
 ## Description
 
