@@ -1,2 +1,2 @@
 openreward
-yc-bench @ git+https://github.com/collinear-ai/yc-bench.git
+yc-bench @ git+https://github.com/collinear-ai/yc-bench.git@6ba312f85b4786bb5c215e6bab7ae8a24de81242

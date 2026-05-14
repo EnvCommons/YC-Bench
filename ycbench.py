@@ -338,17 +338,19 @@ class YCBench(Environment):
 
     @classmethod
     def list_tasks(cls, split: str) -> list[JSONObject]:
+        # Upstream yc-bench collapsed to a single `default` preset in PR #21
+        # (2026-04-01); the old `easy` / 1-year-horizon preset no longer ships.
+        # Both splits use `default` now, with disjoint seeds so train and test
+        # remain independent.
         if split == "train":
-            preset = "easy"
             seeds = [1, 2, 3]
         elif split == "test":
-            preset = "default"
-            seeds = [1, 2, 3]
+            seeds = [4, 5, 6]
         else:
             raise ValueError(f"Unknown split: {split}")
 
         return [
-            {"id": f"{preset}_{seed}", "preset": preset, "seed": seed}
+            {"id": f"default_{seed}", "preset": "default", "seed": seed}
             for seed in seeds
         ]
 
