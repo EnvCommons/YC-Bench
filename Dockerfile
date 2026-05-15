@@ -24,7 +24,5 @@ RUN uv venv --python 3.12
 COPY . /app
 RUN uv pip install -r /app/requirements.txt
 
-ENV YC_BENCH_BIN="/app/.venv/bin/yc-bench"
-
 EXPOSE 8080
 CMD ["uv", "run", "python", "/app/server.py"]
