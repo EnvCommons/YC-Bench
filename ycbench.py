@@ -1,10 +1,11 @@
+import contextlib
+import io
 import json
 import os
 import shlex
 import shutil
-import subprocess
-import sys
 import tempfile
+import threading
 from pathlib import Path
 from typing import List
 
@@ -12,11 +13,62 @@ from pydantic import BaseModel
 
 from openreward.environments import Environment, JSONObject, ToolOutput, TextBlock, tool
 
+# Pre-warm yc-bench's import graph (pydantic, sqlalchemy, typer, all subcommand
+# modules) once at module load. Per-session setup then only pays for the
+# actual sim work, not for cold Python + yc-bench imports every time.
+from yc_bench.cli import app as _yc_app
+from yc_bench.cli import _engine_cache as _yc_engine_cache
+from yc_bench.config import load_config as _yc_load_config
+
 MAX_COMMANDS = 5000
 AUTO_RESUME_THRESHOLD = 30
 
-# Resolve the yc-bench binary path once at import time
-_YC_BENCH_BIN = os.environ.get("YC_BENCH_BIN", "/tmp/ycbench-venv/bin/yc-bench")
+_yc_invoke_lock = threading.Lock()
+
+
+def _invoke_yc(argv: list[str], db_url: str, experiment: str) -> dict:
+    """Dispatch a yc-bench command via the typer app in-process.
+
+    yc-bench reads DATABASE_URL and YC_BENCH_EXPERIMENT from os.environ at
+    call time, so we serialize all invocations on a pod-wide lock while we
+    swap those env vars.
+    """
+    if argv and argv[0] == "yc-bench":
+        argv = argv[1:]
+    buf = io.StringIO()
+    err_buf = io.StringIO()
+    exit_code = 0
+    with _yc_invoke_lock:
+        prev_db = os.environ.get("DATABASE_URL")
+        prev_exp = os.environ.get("YC_BENCH_EXPERIMENT")
+        os.environ["DATABASE_URL"] = db_url
+        os.environ["YC_BENCH_EXPERIMENT"] = experiment
+        try:
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err_buf):
+                _yc_app(argv, standalone_mode=False)
+        except SystemExit as e:
+            try:
+                exit_code = int(e.code) if e.code is not None else 0
+            except (TypeError, ValueError):
+                exit_code = 1
+        except Exception as e:
+            exit_code = 1
+            err_buf.write(f"{type(e).__name__}: {e}")
+        finally:
+            if prev_db is None:
+                os.environ.pop("DATABASE_URL", None)
+            else:
+                os.environ["DATABASE_URL"] = prev_db
+            if prev_exp is None:
+                os.environ.pop("YC_BENCH_EXPERIMENT", None)
+            else:
+                os.environ["YC_BENCH_EXPERIMENT"] = prev_exp
+    return {
+        "ok": exit_code == 0,
+        "exit_code": exit_code,
+        "stdout": buf.getvalue(),
+        "stderr": err_buf.getvalue(),
+    }
 
 SYSTEM_PROMPT = """\
 You are the CEO of a startup in a business simulation. Maximize funds and prestige while avoiding bankruptcy.
@@ -102,63 +154,21 @@ class YCBench(Environment):
         # Initialize simulation
         self._init_simulation()
 
-    def _get_env(self) -> dict[str, str]:
-        """Build subprocess environment with session-specific DB and config."""
-        env = os.environ.copy()
-        env["DATABASE_URL"] = self.db_url
-        env["YC_BENCH_EXPERIMENT"] = self.preset
-        return env
-
     def _execute_command(self, command: str) -> dict:
-        """Run a yc-bench command via subprocess."""
+        """Run a yc-bench command in-process via the typer app."""
         try:
             argv = shlex.split(command)
         except ValueError as e:
             return {"ok": False, "exit_code": 2, "stdout": "", "stderr": str(e)}
-
-        if argv and argv[0] == "yc-bench":
-            argv[0] = _YC_BENCH_BIN
-
-        try:
-            proc = subprocess.run(
-                argv,
-                shell=False,
-                text=True,
-                capture_output=True,
-                timeout=60.0,
-                env=self._get_env(),
-            )
-            return {
-                "ok": proc.returncode == 0,
-                "exit_code": proc.returncode,
-                "stdout": proc.stdout,
-                "stderr": proc.stderr,
-            }
-        except subprocess.TimeoutExpired:
-            return {"ok": False, "exit_code": 124, "stdout": "", "stderr": "command timed out"}
-        except Exception as exc:
-            return {"ok": False, "exit_code": 1, "stdout": "", "stderr": str(exc)}
+        return _invoke_yc(argv, self.db_url, self.preset)
 
     def _load_config_values(self) -> dict:
-        """Read config values from the yc-bench preset using the Python 3.12 venv."""
-        python_bin = str(Path(_YC_BENCH_BIN).parent / "python")
-        script = (
-            "from yc_bench.config import load_config; import json, os; "
-            f"c = load_config('{self.preset}'); "
-            "print(json.dumps({'horizon_years': c.sim.horizon_years}))"
-        )
+        """Read config values from the yc-bench preset."""
         try:
-            proc = subprocess.run(
-                [python_bin, "-c", script],
-                capture_output=True, text=True, timeout=15.0,
-                env=self._get_env(),
-            )
-            if proc.returncode == 0:
-                return json.loads(proc.stdout.strip())
+            cfg = _yc_load_config(self.preset)
+            return {"horizon_years": cfg.sim.horizon_years}
         except Exception:
-            pass
-        # Fallback defaults
-        return {"horizon_years": 3}
+            return {"horizon_years": 3}
 
     def _init_simulation(self) -> None:
         """Initialize the yc-bench simulation via CLI subprocess."""
@@ -333,6 +343,12 @@ class YCBench(Environment):
         )
 
     async def teardown(self) -> None:
+        engine = _yc_engine_cache.pop(self.db_url, None)
+        if engine is not None:
+            try:
+                engine.dispose()
+            except Exception:
+                pass
         if self.db_dir and Path(self.db_dir).exists():
             shutil.rmtree(self.db_dir, ignore_errors=True)
 
