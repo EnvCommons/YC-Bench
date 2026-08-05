@@ -23,6 +23,9 @@ from yc_bench.config import load_config as _yc_load_config
 MAX_COMMANDS = 5000
 AUTO_RESUME_THRESHOLD = 30
 
+# Total loss of starting capital. Funds can go arbitrarily negative, so clamp.
+POTENTIAL_FLOOR = -1.0
+
 _yc_invoke_lock = threading.Lock()
 
 
@@ -70,8 +73,46 @@ def _invoke_yc(argv: list[str], db_url: str, experiment: str) -> dict:
         "stderr": err_buf.getvalue(),
     }
 
+
+def _expected_delta(resume_outputs: list[str]) -> int | None:
+    """Sum the `balance_delta` the engine reports across this step's resumes.
+
+    None means unparseable, so skip the cross-check — not that no money moved.
+    """
+    total = 0
+    for stdout in resume_outputs:
+        try:
+            total += int(json.loads(stdout.strip())["balance_delta"])
+        except (json.JSONDecodeError, ValueError, KeyError, TypeError):
+            return None
+    return total
+
+
+def _ledger_breakdown(rows: list) -> dict[str, int]:
+    """Aggregate ledger rows by economic meaning.
+
+    yc-bench records deadline-miss penalties as negative `task_reward` rows, so
+    direction comes from the sign rather than the category.
+    """
+    totals: dict[str, int] = {}
+    for row in rows:
+        try:
+            amount = int(row["amount_cents"])
+            category = str(row["category"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if category == "task_reward" and amount < 0:
+            category = "task_fail_penalty"
+        totals[category] = totals.get(category, 0) + amount
+    return totals
+
+
 SYSTEM_PROMPT = """\
-You are the CEO of a startup in a business simulation. Maximize funds and prestige while avoiding bankruptcy.
+You are the CEO of a startup in a business simulation.
+
+Your objective: maximize the company's funds relative to your starting capital, avoiding bankruptcy.
+You are scored on profit as a fraction of the capital you began with. Prestige and client trust are
+instrumental — they gate and scale task payouts — but they are not scored directly.
 
 All actions use `yc-bench` CLI commands via `run_command`. All return JSON.
 
@@ -151,6 +192,11 @@ class YCBench(Environment):
         self.finished: bool = False
         self.terminal_reason: str | None = None
 
+        # Step rewards are potential deltas, so their sum is the current potential.
+        self.ledger_cursor: int = 0
+        self.ledger_total_cents: int = 0
+        self.potential: float = 0.0
+
         # Initialize simulation
         self._init_simulation()
 
@@ -163,17 +209,31 @@ class YCBench(Environment):
         return _invoke_yc(argv, self.db_url, self.preset)
 
     def _load_config_values(self) -> dict:
-        """Read config values from the yc-bench preset."""
+        """Read the values the simulation needs from the yc-bench preset.
+
+        Raises on an unloadable preset: guessing a horizon would silently build
+        a simulation of the wrong length.
+        """
+        cfg = _yc_load_config(self.preset)
+        return {
+            "horizon_years": cfg.sim.horizon_years,
+            "initial_funds_cents": cfg.world.initial_funds_cents,
+        }
+
+    def _read_funds_cents(self) -> int | None:
+        """Read the authoritative balance from `company status`."""
+        status = self._execute_command("yc-bench company status")
+        if not status["ok"]:
+            return None
         try:
-            cfg = _yc_load_config(self.preset)
-            return {"horizon_years": cfg.sim.horizon_years}
-        except Exception:
-            return {"horizon_years": 3}
+            return int(json.loads(status["stdout"].strip())["funds_cents"])
+        except (json.JSONDecodeError, ValueError, KeyError, TypeError):
+            return None
 
     def _init_simulation(self) -> None:
-        """Initialize the yc-bench simulation via CLI subprocess."""
+        """Initialize the yc-bench simulation via the in-process CLI."""
         config_vals = self._load_config_values()
-        horizon_years = config_vals.get("horizon_years", 3)
+        horizon_years = config_vals["horizon_years"]
 
         result = self._execute_command(
             f"yc-bench sim init "
@@ -187,14 +247,16 @@ class YCBench(Environment):
                 f"Failed to initialize yc-bench simulation: {result['stderr'] or result['stdout']}"
             )
 
-        # Read initial funds
-        status = self._execute_command("yc-bench company status")
-        if status["ok"]:
-            try:
-                data = json.loads(status["stdout"].strip())
-                self.initial_funds_cents = data.get("funds_cents", 0)
-            except (json.JSONDecodeError, ValueError):
-                self.initial_funds_cents = 0
+        # Every reward is normalized by this, so never let it be zero.
+        funds = self._read_funds_cents()
+        if funds is None:
+            funds = config_vals["initial_funds_cents"]
+        if funds <= 0:
+            raise RuntimeError(
+                "Could not determine initial funds for preset "
+                f"{self.preset!r}; refusing to start with an unnormalizable reward."
+            )
+        self.initial_funds_cents = funds
 
     def _check_terminal(self, stdout: str) -> ToolOutput | None:
         """Parse sim resume JSON for terminal conditions."""
@@ -205,43 +267,111 @@ class YCBench(Environment):
 
         terminal_reason = payload.get("terminal_reason")
         if terminal_reason in ("bankruptcy", "horizon_end"):
-            return self._force_terminal(terminal_reason, extra_text=stdout)
+            # A successful resume resets the auto-resume counter, so this
+            # payload's delta is the whole of what moved in this step.
+            return self._force_terminal(
+                terminal_reason,
+                extra_text=stdout,
+                expected_delta_cents=_expected_delta([stdout]),
+            )
         return None
 
-    def _calculate_reward(self) -> float:
-        """Compute reward from current simulation state."""
-        status = self._execute_command("yc-bench company status")
-        final_funds = 0
+    def _potential_for(self, funds_cents: int) -> float:
+        """Normalized profit against starting capital, floored at total loss."""
+        profit = funds_cents - self.initial_funds_cents
+        return max(POTENTIAL_FLOOR, profit / self.initial_funds_cents)
+
+    def _flush_ledger(self, expected_delta_cents: int | None = None) -> tuple[float | None, dict]:
+        """Consume new ledger rows and return the telescoping step reward.
+
+        The ledger records every change to funds after seeding, so
+        `funds == initial_funds + sum(amount_cents)` holds and no balance read
+        is needed. Returns (None, ...) if unreadable, leaving the cursor
+        untouched so the next flush catches up.
+        """
+        result = self._execute_command("yc-bench finance ledger")
         try:
-            data = json.loads(status.get("stdout", "{}").strip())
-            final_funds = data.get("funds_cents", 0)
-        except (json.JSONDecodeError, ValueError):
-            pass
+            payload = json.loads(result.get("stdout", "").strip())
+            entries = payload["entries"]
+            total_cents = int(payload["total_amount_cents"])
+        except (json.JSONDecodeError, ValueError, KeyError, TypeError):
+            return None, {"ledger_read_failed": True}
 
-        if self.terminal_reason == "bankruptcy" or final_funds < 0:
-            return 0.0
+        # One payroll writes a row per employee at an identical `occurred_at`
+        # and the ledger has no secondary sort key, so count the rows and diff
+        # the totals rather than relying on their order.
+        new_rows = entries[self.ledger_cursor:]
+        delta_cents = total_cents - self.ledger_total_cents
+        self.ledger_cursor = len(entries)
+        self.ledger_total_cents = total_cents
 
-        if self.initial_funds_cents > 0:
-            return min(1.0, max(0.0, final_funds / self.initial_funds_cents))
-        return 0.0
+        step_reward = self._advance_potential(
+            self._potential_for(self.initial_funds_cents + total_cents)
+        )
 
-    def _force_terminal(self, reason: str, extra_text: str = "") -> ToolOutput:
-        """End the simulation and return final reward."""
+        meta = {
+            "step_reward": step_reward,
+            "episode_return": self.potential,
+            "funds_cents": self.initial_funds_cents + total_cents,
+            "ledger_delta_cents": delta_cents,
+            "ledger_rows": len(new_rows),
+            "ledger_breakdown": _ledger_breakdown(new_rows),
+        }
+        if expected_delta_cents is not None and expected_delta_cents != delta_cents:
+            meta["ledger_balance_delta_mismatch"] = {
+                "engine_balance_delta": expected_delta_cents,
+                "ledger_delta": delta_cents,
+            }
+        return step_reward, meta
+
+    def _advance_potential(self, potential: float) -> float:
+        """Move to a new potential and return the delta to emit as reward."""
+        step_reward = potential - self.potential
+        self.potential = potential
+        return step_reward
+
+    def _force_terminal(
+        self,
+        reason: str,
+        extra_text: str = "",
+        expected_delta_cents: int | None = None,
+    ) -> ToolOutput:
+        """End the simulation, emitting the residual telescoping delta.
+
+        Never the cumulative return, which would double-count against the sum.
+        """
         self.finished = True
         self.terminal_reason = reason
-        reward = self._calculate_reward()
+        step_reward, ledger_meta = self._flush_ledger(expected_delta_cents)
+
+        if step_reward is None:
+            # The residual is the one delta worth a second attempt.
+            funds = self._read_funds_cents()
+            if funds is not None:
+                step_reward = self._advance_potential(self._potential_for(funds))
+                ledger_meta = {
+                    **ledger_meta,
+                    "step_reward": step_reward,
+                    "episode_return": self.potential,
+                    "funds_cents": funds,
+                    "reward_source": "company_status",
+                }
 
         text = extra_text or ""
-        text += f"\n\n=== SIMULATION ENDED ===\nReason: {reason}\nReward: {reward:.4f}"
+        text += (
+            f"\n\n=== SIMULATION ENDED ===\n"
+            f"Reason: {reason}\n"
+            f"Episode return: {self.potential:.4f}"
+        )
 
         return ToolOutput(
             blocks=[TextBlock(text=text)],
             metadata={
+                **ledger_meta,
                 "terminal_reason": reason,
-                "reward": reward,
                 "command_count": self.command_count,
             },
-            reward=reward,
+            reward=step_reward,
             finished=True,
         )
 
@@ -301,11 +431,13 @@ class YCBench(Environment):
         stderr = result.get("stderr", "")
         exit_code = result.get("exit_code", 1)
 
-        # Check if this was sim resume
+        # Only a resume can move money, so only a resume can produce a reward.
         is_resume = len(argv) >= 3 and argv[1] == "sim" and argv[2] == "resume"
+        resume_outputs: list[str] = []
 
         if is_resume and exit_code == 0:
             self.commands_since_resume = 0
+            resume_outputs.append(stdout)
             terminal = self._check_terminal(stdout)
             if terminal:
                 return terminal
@@ -320,6 +452,7 @@ class YCBench(Environment):
             self.commands_since_resume = 0
             auto_stdout = auto_result.get("stdout", "")
             if auto_result.get("exit_code", 1) == 0:
+                resume_outputs.append(auto_stdout)
                 terminal = self._check_terminal(auto_stdout)
                 if terminal:
                     return terminal
@@ -328,17 +461,29 @@ class YCBench(Environment):
                     f"commands without sim resume]\n{auto_stdout}"
                 )
 
+        step_reward: float | None = None
+        ledger_meta: dict = {}
+        if resume_outputs:
+            step_reward, ledger_meta = self._flush_ledger(_expected_delta(resume_outputs))
+
         # Build output
         output_text = stdout if exit_code == 0 else (stderr or stdout or "Command failed")
         output_text += auto_resume_text
+        if step_reward is not None:
+            output_text += (
+                f"\n\n[cash flow: {ledger_meta.get('ledger_delta_cents', 0):+d}c | "
+                f"step reward: {step_reward:+.4f} | return: {self.potential:+.4f}]"
+            )
 
         return ToolOutput(
             blocks=[TextBlock(text=output_text)],
             metadata={
+                **ledger_meta,
                 "exit_code": exit_code,
                 "command": command,
                 "command_count": self.command_count,
             },
+            reward=step_reward,
             finished=False,
         )
 

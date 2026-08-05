@@ -343,12 +343,16 @@ class TestFinancialSystem:
         after = run(env, "yc-bench company status")["funds_cents"]
         assert after > before, "Completing a task should increase funds"
 
-    def test_reward_calculation_formula(self):
-        """reward = min(1.0, max(0.0, final_funds / initial_funds))"""
+    def test_potential_is_normalized_profit(self):
+        """Phi = max(-1.0, (funds - initial_funds) / initial_funds)"""
         env = make_env()
-        # Initial funds = 20M, at start reward should be 1.0
-        reward = env._calculate_reward()
-        assert reward == 1.0  # 20M / 20M = 1.0
+        initial = env.initial_funds_cents
+        assert env._potential_for(initial) == 0.0
+        assert env._potential_for(initial * 2) == 1.0
+        assert env._potential_for(initial // 2) == -0.5
+        # Any negative balance is total loss, however far past zero it went.
+        assert env._potential_for(0) == -1.0
+        assert env._potential_for(-50 * initial) == -1.0
 
     def test_finance_ledger_empty_initially(self):
         env = make_env()
@@ -658,13 +662,14 @@ class TestTerminalConditions:
         assert result.reward is not None
         assert isinstance(result.reward, float)
 
-    def test_reward_is_ratio_of_funds(self):
-        """reward = min(1.0, max(0.0, final_funds / initial_funds))"""
+    def test_terminal_reward_is_residual_delta(self):
+        """The terminal step emits its residual delta, never the cumulative return."""
         env = make_env()
-        # At start, funds == initial_funds, so reward should be 1.0
+        # Nothing has happened, so there is no profit and no residual to emit.
         env.command_count = MAX_COMMANDS
         result = env.run_command(RunCommandInput(command="yc-bench company status"))
-        assert result.reward == 1.0
+        assert result.reward == 0.0
+        assert result.metadata["episode_return"] == 0.0
 
 
 # =====================================================================
@@ -836,7 +841,9 @@ class TestPromptVerification:
         """SYSTEM_PROMPT constant should match the original agent/prompt.py content."""
         # Key phrases from the original
         assert "You are the CEO of a startup" in SYSTEM_PROMPT
-        assert "Maximize funds and prestige while avoiding bankruptcy" in SYSTEM_PROMPT
+        assert "maximize the company's funds relative to your starting capital" in SYSTEM_PROMPT
+        assert "avoiding bankruptcy" in SYSTEM_PROMPT
+        assert "scored on profit" in SYSTEM_PROMPT
         assert "Core Workflow" in SYSTEM_PROMPT
         assert "yc-bench market browse" in SYSTEM_PROMPT
 
