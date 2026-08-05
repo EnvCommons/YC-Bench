@@ -181,7 +181,7 @@ def test_telescoping_invariant():
     return env, outs
 
 
-def test_ledger_matches_engine_balance_delta(outs):
+def check_ledger_matches_engine_balance_delta(outs):
     """Every step's ledger delta agrees with the engine's own balance_delta."""
     mismatches = [
         o.metadata["ledger_balance_delta_mismatch"]
@@ -194,7 +194,7 @@ def test_ledger_matches_engine_balance_delta(outs):
     assert not failures, f"{len(failures)} ledger reads failed"
 
 
-def test_terminal_emits_residual_not_total(outs):
+def check_terminal_emits_residual_not_total(outs):
     """A cumulative emission at terminal would double-count against the sum."""
     terminal = outs[-1]
     total = terminal.metadata["episode_return"]
@@ -204,7 +204,7 @@ def test_terminal_emits_residual_not_total(outs):
     )
 
 
-def test_cash_flow_attribution(env, outs):
+def check_cash_flow_attribution(env, outs):
     """Ledger breakdowns account for the whole change in funds, signed correctly."""
     seen: dict[str, int] = {}
     for out in outs:
@@ -291,9 +291,9 @@ def main() -> int:
     played = check("telescoping invariant", test_telescoping_invariant)
     if played:
         env, outs = played
-        check("ledger matches engine balance_delta", test_ledger_matches_engine_balance_delta, outs)
-        check("terminal emits residual not total", test_terminal_emits_residual_not_total, outs)
-        check("cash flow attribution", test_cash_flow_attribution, env, outs)
+        check("ledger matches engine balance_delta", check_ledger_matches_engine_balance_delta, outs)
+        check("terminal emits residual not total", check_terminal_emits_residual_not_total, outs)
+        check("cash flow attribution", check_cash_flow_attribution, env, outs)
 
     check("bankruptcy floors at -1.0", test_bankruptcy_floors_at_minus_one)
     check("truncation banks partial credit", test_truncation_banks_partial_credit)
