@@ -48,6 +48,8 @@ async def main():
             input_list = [{"role": "user", "content": prompt[0].text}]
             finished = False
             turn = 0
+            # Rewards are per-step deltas, so the episode return is their sum.
+            total_reward = 0.0
 
             rollout.log_openai_response(message=input_list[0], is_finished=finished)
 
@@ -101,13 +103,14 @@ async def main():
 
                         cmd = args.get("command", "")
                         print(f"[Turn {turn}] {cmd}")
-                        if reward and reward != 0:
-                            print(f"  Reward: {reward:.4f}")
+                        if reward is not None:
+                            total_reward += reward
+                            print(f"  Step reward: {reward:+.4f} | return: {total_reward:+.4f}")
 
                         if finished:
                             print(f"\n{'='*60}")
                             print(f"FINISHED! Reason: {tool_result.metadata}")
-                            print(f"Final reward: {reward:.4f}")
+                            print(f"Episode return: {total_reward:+.4f}")
                             print(f"Total turns: {turn}")
                             print(f"{'='*60}")
                             break

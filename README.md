@@ -4,7 +4,7 @@
 
 ## Description
 
-YC-Bench is a long-horizon deterministic benchmark that simulates running an AI startup as CEO. The agent manages 10 employees across 4 technical domains (research, inference, data_environment, training), accepts tasks from a marketplace, assigns employees, and navigates financial and operational pressures over 1–3 simulated years. Terminal conditions are bankruptcy (funds drop below zero) or reaching the simulation horizon.
+YC-Bench is a long-horizon deterministic benchmark that simulates running an AI startup as CEO. The agent manages 8 employees across 4 technical domains (research, inference, data_environment, training), accepts tasks from a marketplace, assigns employees, and navigates financial and operational pressures over one simulated year. Terminal conditions are bankruptcy (funds drop below zero) or reaching the simulation horizon.
 
 The simulation is built on a full business engine with payroll, prestige systems, client trust mechanics, adversarial clients (RATs), and multi-domain task requirements. All interactions happen through a CLI interface via the `run_command` tool.
 
@@ -27,25 +27,50 @@ No sandbox or GPU required. The simulation runs as a lightweight SQLite-backed C
 
 ## Tasks
 
-There are 3 training tasks and 3 test tasks:
+There are 3 training tasks and 3 test tasks, all on the `default` preset with disjoint seeds:
 
-**Training (easy preset, 1-year horizon):**
-- `easy_1`, `easy_2`, `easy_3` — Single-domain tasks, accessible prestige requirements, forgiving penalties. Tests basic throughput awareness.
+- **Training:** `default_1`, `default_2`, `default_3` (seeds 1–3)
+- **Test:** `default_4`, `default_5`, `default_6` (seeds 4–6)
 
-**Test (default preset, 3-year horizon):**
-- `default_1`, `default_2`, `default_3` — Multi-domain tasks, prestige mode=4 (most tasks need prestige 3–5), tight deadlines, costly cancellations. The canonical benchmark configuration.
+Upstream collapsed to a single `default` preset, so the former `easy` preset no longer exists.
 
 Each task is parameterized by a random seed that determines the employee skills, client mix, and task pool. Employees and clients are deterministic across seeds (fixed world seed), while the task marketplace varies per seed.
 
 ## Reward Structure
 
-This is a sparse reward environment. Reward is computed at terminal:
+This is a **dense reward** environment. Reward is emitted per step as a telescoping delta of a
+potential — normalized profit against the company's starting capital of $200,000:
 
-$$R = \begin{cases} 0 & \text{if bankrupt (funds} < 0\text{)} \\ \min\left(1, \frac{\text{final\_funds}}{\text{initial\_funds}}\right) & \text{if survived to horizon} \end{cases}$$
+$$\Phi_t = \max\left(-1,\ \frac{\text{funds}_t - \text{initial\_funds}}{\text{initial\_funds}}\right)
+\qquad r_t = \Phi_t - \Phi_{t-1}$$
 
-Initial funds are $200,000 for easy tasks and $150,000 for default tasks.
+Since $\Phi_0 = 0$, the rewards telescope: **the sum of step rewards is the episode return**, equal
+to profit as a fraction of starting capital. Each individual reward is simply that step's net cash
+flow divided by initial funds.
+
+| outcome | return |
+|---|---|
+| bankrupt (funds < 0) | −1.0 |
+| break-even | 0.0 |
+| +50% profit | +0.5 |
+| doubled capital | +1.0 (uncapped above) |
+
+The floor engages exactly when funds reach zero, so any bankruptcy scores −1.0 regardless of how
+far past zero the final payroll pushed the balance.
+
+Rewards are derived from the simulation's financial **ledger**, which is a complete record of every
+change to company funds (`funds == initial_funds + sum(ledger)` holds at all times). Only
+`sim resume` can move money, so only a resume carries a reward; all observation and task-management
+commands return no reward. Per-step metadata carries `step_reward`, `episode_return`, `funds_cents`
+and a signed `ledger_breakdown` by category, so the reward is fully auditable from a trajectory.
+
+Because credit is banked as it is earned, a rollout truncated by a turn or time limit keeps the
+profit it has already made rather than scoring nothing.
 
 We do not use LLM graders. Reward is purely deterministic from simulation state.
+
+**Consumer note:** step rewards must be **summed** to obtain the episode return. A consumer that
+takes the last reward, or the maximum, will misreport it.
 
 ## Data
 
@@ -64,20 +89,23 @@ Agents have a single tool:
   - `client list/history` — client trust and reliability info
   - `finance ledger` — transaction history
   - `scratchpad write/append/read` — persistent notes (survive context truncation)
-  - `report monthly` — monthly P&L summary
 
 All commands return JSON.
 
 ## Time Horizon
 
-YC-Bench is a very long-horizon environment. Easy tasks simulate 1 year of business operations; default tasks simulate 3 years. A single episode typically involves hundreds of tool calls.
+YC-Bench is a very long-horizon environment. Every task simulates 1 year of business operations, and a single episode typically involves hundreds of tool calls.
 
 ## Environment Difficulty
 
-Difficulty varies by preset:
+The `default` preset is demanding. Payroll compounds — every completed task raises the salary of
+each assigned employee — so assigning everyone to everything grows costs far faster than revenue,
+and payroll alone will bankrupt an idle company partway through the year. On top of that, ~35% of
+clients are adversarial and inflate work requirements after acceptance, 30% of tasks are gated
+behind client trust, and missing a deadline costs 35% of the advertised reward plus prestige.
 
-- **Easy**: Most tasks accessible at prestige 1, single-domain, forgiving penalties. Tests whether agents avoid throughput dilution from excessive parallelism.
-- **Default**: Multi-domain tasks requiring prestige 3–5, tight deadlines, 1.4x failure penalties, 2.0x cancellation penalties. Tests sustained strategic decision-making over 3 years.
+Tests: employee-allocation efficiency, adversarial client detection, trust building, and cash-flow
+management sustained over hundreds of turns.
 
 ## Other Environment Requirements
 
