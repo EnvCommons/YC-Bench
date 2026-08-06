@@ -1094,10 +1094,14 @@ class TestSimulationTime:
 class TestKnownBugs:
     """Document known bugs in the original yc-bench code."""
 
-    @pytest.mark.xfail(reason="Original yc-bench bug: task_commands.py:566 uses .astext (PostgreSQL only, fails on SQLite)")
     def test_task_cancel_works(self):
-        """Task cancel should apply prestige penalty and return info."""
-        env = make_env()
+        """Task cancel should apply prestige penalty and return info.
+
+        Was an upstream SQLite bug (`.astext` is PostgreSQL-JSONB only), fixed
+        in yc-bench 486957c and picked up by the 61aa49c pin.
+        """
+        env = make_env(DEFAULT_TASK)
         run(env, "yc-bench task accept --task-id Task-10")
         data = run(env, "yc-bench task cancel --task-id Task-10 --reason testing")
         assert data.get("status") == "cancelled"
+        assert "cancel_penalty_per_domain" in data
