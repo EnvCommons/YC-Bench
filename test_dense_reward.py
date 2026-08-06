@@ -137,6 +137,25 @@ def test_inert_commands_emit_no_reward():
     assert env.potential == 0.0
 
 
+def test_syntax_error_surfaces_diagnostic():
+    """A malformed command reports what is wrong, not just that it is wrong.
+
+    Reproduces the live failure from run 20260805-152711 step 11: a scratchpad
+    write whose quoted content was missing its closing double-quote.
+    """
+    env = make_env()
+    out, data = run(env, 'yc-bench scratchpad write --content "unterminated')
+    assert out.reward is None, "a rejected command moves no money"
+    assert data is not None, f"error should be JSON, got {out.blocks[0].text[:80]!r}"
+    assert "No closing quotation" in data["error"], (
+        f"shlex diagnostic not surfaced: {data['error']!r}"
+    )
+    assert out.metadata["detail"], "metadata should carry the diagnostic too"
+    # A well-formed command still works afterwards.
+    ok, parsed = run(env, "yc-bench company status")
+    assert parsed and "funds_cents" in parsed
+
+
 def test_telescoping_invariant():
     """At every step, the summed rewards equal the true potential.
 
@@ -287,6 +306,7 @@ def main() -> int:
     print("YC-Bench dense reward verification\n")
     check("potential is normalized profit", test_potential_is_normalized_profit)
     check("inert commands emit no reward", test_inert_commands_emit_no_reward)
+    check("syntax error surfaces diagnostic", test_syntax_error_surfaces_diagnostic)
 
     played = check("telescoping invariant", test_telescoping_invariant)
     if played:
