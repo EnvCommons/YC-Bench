@@ -406,13 +406,14 @@ class YCBench(Environment):
 
         command = params.command.strip()
 
-        # Validate
+        # Validate. shlex says exactly what is wrong ("No closing quotation"),
+        # which the agent needs to repair a long quoted argument.
         try:
             argv = shlex.split(command)
-        except ValueError:
+        except ValueError as e:
             return ToolOutput(
-                blocks=[TextBlock(text=json.dumps({"error": "Invalid command syntax"}))],
-                metadata={"error": "invalid_syntax"},
+                blocks=[TextBlock(text=json.dumps({"error": f"Invalid command syntax: {e}"}))],
+                metadata={"error": "invalid_syntax", "detail": str(e)},
                 finished=False,
             )
 
