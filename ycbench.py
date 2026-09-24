@@ -1,9 +1,10 @@
-import contextlib
+import asyncio
 import io
 import json
 import os
 import shlex
 import shutil
+import sys
 import tempfile
 import threading
 from pathlib import Path
@@ -29,6 +30,42 @@ POTENTIAL_FLOOR = -1.0
 _yc_invoke_lock = threading.Lock()
 
 
+class _ThreadRoutedStream:
+    """Per-thread stdout capture; a global redirect leaks other threads' logs into tool output."""
+
+    def __init__(self, real):
+        self._real = real
+        self._local = threading.local()
+
+    def capture(self, buf):
+        self._local.buf = buf
+
+    def release(self):
+        self._local.buf = None
+
+    def _target(self):
+        buf = getattr(self._local, "buf", None)
+        return self._real if buf is None else buf
+
+    def write(self, s):
+        return self._target().write(s)
+
+    def flush(self):
+        return self._target().flush()
+
+    def __getattr__(self, name):
+        return getattr(self._target(), name)
+
+
+def _routed(name: str) -> _ThreadRoutedStream:
+    """Install the router on sys.<name>, re-wrapping if something replaced it since."""
+    stream = getattr(sys, name)
+    if not isinstance(stream, _ThreadRoutedStream):
+        stream = _ThreadRoutedStream(stream)
+        setattr(sys, name, stream)
+    return stream
+
+
 def _invoke_yc(argv: list[str], db_url: str, experiment: str) -> dict:
     """Dispatch a yc-bench command via the typer app in-process.
 
@@ -46,9 +83,11 @@ def _invoke_yc(argv: list[str], db_url: str, experiment: str) -> dict:
         prev_exp = os.environ.get("YC_BENCH_EXPERIMENT")
         os.environ["DATABASE_URL"] = db_url
         os.environ["YC_BENCH_EXPERIMENT"] = experiment
+        out, err = _routed("stdout"), _routed("stderr")
+        out.capture(buf)
+        err.capture(err_buf)
         try:
-            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err_buf):
-                _yc_app(argv, standalone_mode=False)
+            _yc_app(argv, standalone_mode=False)
         except SystemExit as e:
             try:
                 exit_code = int(e.code) if e.code is not None else 0
@@ -58,6 +97,8 @@ def _invoke_yc(argv: list[str], db_url: str, experiment: str) -> dict:
             exit_code = 1
             err_buf.write(f"{type(e).__name__}: {e}")
         finally:
+            out.release()
+            err.release()
             if prev_db is None:
                 os.environ.pop("DATABASE_URL", None)
             else:
@@ -376,7 +417,8 @@ class YCBench(Environment):
         )
 
     async def get_prompt(self) -> List[TextBlock]:
-        status = self._execute_command("yc-bench company status")
+        # Off the event loop: the call may wait on the pod-wide lock.
+        status = await asyncio.to_thread(self._execute_command, "yc-bench company status")
         initial_state = status.get("stdout", "") if status["ok"] else "Could not load initial state."
 
         prompt_text = (
@@ -489,7 +531,12 @@ class YCBench(Environment):
         )
 
     async def teardown(self) -> None:
-        engine = _yc_engine_cache.pop(self.db_url, None)
+        # Off the event loop: waiting on the pod-wide lock would stall every session.
+        await asyncio.to_thread(self._teardown_sync)
+
+    def _teardown_sync(self) -> None:
+        with _yc_invoke_lock:
+            engine = _yc_engine_cache.pop(self.db_url, None)
         if engine is not None:
             try:
                 engine.dispose()
